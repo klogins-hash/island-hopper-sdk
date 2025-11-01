@@ -12,11 +12,20 @@ from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from enum import Enum
 
-import openai
-from openai import OpenAI
-import httpx
+# Optional imports with fallbacks
+try:
+    import openai
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    OpenAI = None
 
-from strands.models.openai import OpenAIModel
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
 
 
 class RoutingStrategy(Enum):
@@ -113,7 +122,7 @@ class ModelRouter:
             raise ValueError(f"Unknown provider: {provider_name}")
 
 
-class ScalewayModel(OpenAIModel):
+class ScalewayModel:
     """
     Provider-agnostic model with flexible routing.
     
@@ -143,37 +152,90 @@ class ScalewayModel(OpenAIModel):
         Args:
             provider_config: Dictionary of provider configurations
             model_config: Dictionary of model routing configuration
-            **kwargs: Additional arguments passed to OpenAIModel
+            **kwargs: Additional arguments
         """
         # Load default configuration if none provided
         provider_config = provider_config or self._get_default_providers()
         model_config = model_config or self._get_default_model_config()
         
-        # Parse configurations
-        providers = self._parse_providers(provider_config)
-        model_cfg = self._parse_model_config(model_config)
+        # Initialize configuration
+        self.model_config = ModelConfig(**model_config)
+        self.router = ProviderRouter(provider_config, self.model_config)
         
-        # Initialize router
-        self.router = ModelRouter(providers, model_cfg)
+        # Initialize OpenAI clients for each provider
+        self.clients = {}
+        for provider_name in provider_config.keys():
+            self.clients[provider_name] = self._create_client_for_provider(provider_name)
         
-        # Get primary client for initialization
-        primary_client = self.router.get_primary_client()
-        self.fallback_client = self.router.get_fallback_client()
-        
-        # Initialize with primary provider
-        super().__init__(
-            client=primary_client,
-            model=self.router.get_model_for_provider(model_cfg.primary_provider),
-            **kwargs
-        )
-        
-        # Store configuration for failover
-        self.model_config = model_cfg
         self.logger = logging.getLogger(__name__)
+        self.logger.info(f"ScalewayModel initialized with primary provider: {self.model_config.primary_provider}")
+    
+    async def generate(self, prompt: str, **kwargs) -> str:
+        """Generate a response using the configured provider routing"""
+        try:
+            # Get the best provider for this request
+            provider_name = self.router.get_best_provider()
+            model_name = self.get_model_for_provider(provider_name)
+            
+            # Get the appropriate client
+            client = self.clients[provider_name]
+            
+            # Make the API call
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                **kwargs
+            )
+            
+            result = response.choices[0].message.content
+            
+            # Log the usage for routing optimization
+            self.router.log_usage(provider_name, response.usage)
+            
+            return result
+            
+        except Exception as e:
+            # Try fallback provider if available
+            if self.model_config.fallback_provider and provider_name != self.model_config.fallback_provider:
+                self.logger.warning(f"Primary provider {provider_name} failed, trying fallback: {e}")
+                try:
+                    fallback_client = self.clients[self.model_config.fallback_provider]
+                    fallback_model = self.get_model_for_provider(self.model_config.fallback_provider)
+                    
+                    response = fallback_client.chat.completions.create(
+                        model=fallback_model,
+                        messages=[{"role": "user", "content": prompt}],
+                        **kwargs
+                    )
+                    
+                    return response.choices[0].message.content
+                    
+                except Exception as fallback_error:
+                    self.logger.error(f"Fallback provider also failed: {fallback_error}")
+                    raise Exception(f"All providers failed. Primary: {e}, Fallback: {fallback_error}")
+            else:
+                raise e
+    
+    def switch_provider(self, provider_name: str, model_name: str):
+        """Switch to a specific provider and model"""
+        if provider_name not in self.clients:
+            raise ValueError(f"Provider {provider_name} not configured")
         
-        self.logger.info(
-            f"ScalewayModel initialized with primary provider: {model_cfg.primary_provider}"
-        )
+        self.model_config.primary_provider = provider_name
+        self.model_config.primary_model = model_name
+        
+        self.logger.info(f"Switched to provider: {provider_name}, model: {model_name}")
+    
+    def get_provider_info(self) -> Dict[str, Any]:
+        """Get information about current provider configuration"""
+        return {
+            "primary_provider": self.model_config.primary_provider,
+            "primary_model": self.model_config.primary_model,
+            "fallback_provider": self.model_config.fallback_provider,
+            "fallback_model": self.model_config.fallback_model,
+            "routing_strategy": self.model_config.routing_strategy.value,
+            "available_providers": list(self.clients.keys())
+        }
     
     def _get_default_providers(self) -> Dict[str, Any]:
         """Get default provider configuration"""
@@ -187,7 +249,7 @@ class ScalewayModel(OpenAIModel):
             },
             "anthropic": {
                 "name": "Anthropic",
-                "endpoint": "https://api.anthropic.com/v1",
+                "endpoint": "https://api.anthropic.com",
                 "api_key_env": "ANTHROPIC_API_KEY",
                 "models": ["claude-4.5-sonnet", "claude-3-5-sonnet"],
                 "priority": 2
@@ -196,7 +258,7 @@ class ScalewayModel(OpenAIModel):
                 "name": "OpenAI",
                 "endpoint": "https://api.openai.com/v1",
                 "api_key_env": "OPENAI_API_KEY",
-                "models": ["gpt-4", "gpt-4-turbo"],
+                "models": ["gpt-4", "gpt-4-turbo", "gpt-3.5-turbo"],
                 "priority": 3
             }
         }
@@ -208,148 +270,60 @@ class ScalewayModel(OpenAIModel):
             "primary_model": "groq/llama-4-scout",
             "fallback_provider": "anthropic",
             "fallback_model": "claude-4.5-sonnet",
-            "routing_strategy": "cost_optimized"
+            "routing_strategy": "balanced"
         }
     
-    def _parse_providers(self, provider_config: Dict[str, Any]) -> Dict[str, ProviderConfig]:
-        """Parse provider configuration dictionary"""
-        providers = {}
-        for key, config in provider_config.items():
-            providers[key] = ProviderConfig(
-                name=config["name"],
-                endpoint=config["endpoint"],
-                api_key_env=config["api_key_env"],
-                models=config["models"],
-                priority=config.get("priority", 1),
-                max_rpm=config.get("max_rpm"),
-                max_tpm=config.get("max_tpm")
-            )
-        return providers
-    
-    def _parse_model_config(self, model_config: Dict[str, Any]) -> ModelConfig:
-        """Parse model configuration dictionary"""
-        return ModelConfig(
-            primary_provider=model_config["primary_provider"],
-            primary_model=model_config["primary_model"],
-            fallback_provider=model_config.get("fallback_provider"),
-            fallback_model=model_config.get("fallback_model"),
-            routing_strategy=RoutingStrategy(model_config.get("routing_strategy", "balanced"))
+    def _create_client_for_provider(self, provider_name: str) -> OpenAI:
+        """Create OpenAI client for a specific provider"""
+        provider = self.router.providers.get(provider_name)
+        if not provider:
+            raise ValueError(f"Provider {provider_name} not configured")
+        
+        api_key = os.getenv(provider.api_key_env)
+        if not api_key:
+            raise ValueError(f"API key not found for provider {provider_name}. Set {provider.api_key_env} environment variable.")
+        
+        return OpenAI(
+            api_key=api_key,
+            base_url=provider.endpoint
         )
     
-    async def _call_with_fallback(self, *args, **kwargs):
-        """Make API call with automatic fallback to secondary provider"""
-        try:
-            # Try primary provider first
-            return await super()._call(*args, **kwargs)
-        except Exception as primary_error:
-            if self.fallback_client:
-                self.logger.warning(
-                    f"Primary provider {self.model_config.primary_provider} failed: {primary_error}. "
-                    f"Trying fallback {self.model_config.fallback_provider}"
-                )
-                
-                # Temporarily switch to fallback client
-                original_client = self.client
-                original_model = self.model
-                
-                self.client = self.fallback_client
-                self.model = self.router.get_model_for_provider(self.model_config.fallback_provider)
-                
-                try:
-                    result = await super()._call(*args, **kwargs)
-                    self.logger.info(f"Fallback provider {self.model_config.fallback_provider} succeeded")
-                    return result
-                except Exception as fallback_error:
-                    self.logger.error(f"Fallback provider also failed: {fallback_error}")
-                    raise Exception(f"Both providers failed. Primary: {primary_error}, Fallback: {fallback_error}")
-                finally:
-                    # Restore original client
-                    self.client = original_client
-                    self.model = original_model
-            else:
-                # No fallback configured
-                raise primary_error
-    
-    # Override the call method to use fallback
-    async def _call(self, *args, **kwargs):
-        """Override to add fallback logic"""
-        return await self._call_with_fallback(*args, **kwargs)
-    
-    def get_provider_info(self) -> Dict[str, Any]:
-        """Get information about current provider configuration"""
-        return {
-            "primary_provider": self.model_config.primary_provider,
-            "primary_model": self.model_config.primary_model,
-            "fallback_provider": self.model_config.fallback_provider,
-            "fallback_model": self.model_config.fallback_model,
-            "routing_strategy": self.model_config.routing_strategy.value,
-            "available_providers": list(self.router.providers.keys())
-        }
-    
-    def switch_provider(self, new_primary: str, new_model: Optional[str] = None):
-        """
-        Switch to a different provider at runtime.
-        
-        Args:
-            new_primary: Name of the new primary provider
-            new_model: Optional new model name
-        """
-        if new_primary not in self.router.providers:
-            raise ValueError(f"Provider {new_primary} not configured")
-        
-        # Update configuration
-        old_primary = self.model_config.primary_provider
-        self.model_config.primary_provider = new_primary
-        if new_model:
-            self.model_config.primary_model = new_model
-        
-        # Update client
-        self.client = self.router.get_primary_client()
-        self.model = self.router.get_model_for_provider(new_primary)
-        
-        self.logger.info(f"Switched from {old_primary} to {new_primary}")
+    def get_model_for_provider(self, provider_name: str) -> str:
+        """Get the model to use for a specific provider"""
+        if provider_name == self.model_config.primary_provider:
+            return self.model_config.primary_model
+        elif provider_name == self.model_config.fallback_provider:
+            return self.model_config.fallback_model or self.model_config.primary_model
+        else:
+            raise ValueError(f"Unknown provider: {provider_name}")
 
 
-# Convenience function for easy initialization
 def create_scaleway_model(
     primary_provider: str = "openrouter",
     primary_model: str = "groq/llama-4-scout",
-    fallback_provider: Optional[str] = None,
-    fallback_model: Optional[str] = None,
-    api_keys: Optional[Dict[str, str]] = None,
+    fallback_provider: Optional[str] = "anthropic",
+    fallback_model: Optional[str] = "claude-4.5-sonnet",
     **kwargs
 ) -> ScalewayModel:
     """
-    Convenience function to create a ScalewayModel with common configurations.
+    Convenience function to create a ScalewayModel with common configuration.
     
     Args:
-        primary_provider: Name of primary provider
-        primary_model: Model to use with primary provider
-        fallback_provider: Optional fallback provider
-        fallback_model: Optional model for fallback
-        api_keys: Optional API keys (will use environment if not provided)
-        **kwargs: Additional arguments for ScalewayModel
-    
+        primary_provider: Primary provider name
+        primary_model: Primary model name
+        fallback_provider: Fallback provider name
+        fallback_model: Fallback model name
+        **kwargs: Additional arguments
+        
     Returns:
         Configured ScalewayModel instance
     """
-    # Set environment variables if API keys provided
-    if api_keys:
-        for provider, key in api_keys.items():
-            provider_config = {
-                "openrouter": "OPENROUTER_API_KEY",
-                "anthropic": "ANTHROPIC_API_KEY",
-                "openai": "OPENAI_API_KEY"
-            }
-            if provider in provider_config:
-                os.environ[provider_config[provider]] = key
-    
     model_config = {
         "primary_provider": primary_provider,
         "primary_model": primary_model,
         "fallback_provider": fallback_provider,
         "fallback_model": fallback_model,
-        "routing_strategy": "cost_optimized"
+        "routing_strategy": "balanced"
     }
     
     return ScalewayModel(model_config=model_config, **kwargs)
